@@ -421,4 +421,3 @@ with tab4:
 #     st.write("Som Kostprijs:", now_df["Kostprijs"].sum())
 #     st.write("Som Totaal_calc (qty × prijs):", now_df["Totaal_calc"].sum())
 #     st.write("Som TotaalKost (gebruikt):", now_df["TotaalKost"].sum())
-``

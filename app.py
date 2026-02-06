@@ -114,8 +114,8 @@ def kpi_with_delta(container, label: str, current_val: float, prev_val: float, m
     else:
         delta_txt = f"{'+' if delta_val >= 0 else ''}{euro(delta_val) if money else f'{int(delta_val):,}'.replace(',', '.')}"
     value_txt = euro(current_val) if money else f"{int(current_val):,}".replace(",", ".")
-    container.metric(label, value_txt, delta=delta_txt)
-
+    # 🔴⬆️ rood bij stijging, 🟢⬇️ groen bij daling
+    container.metric(label, value_txt, delta=delta_txt, delta_color="inverse")
 # -----------------------------------------------------------------------------
 # 3) Data laden uit Google Sheet
 # -----------------------------------------------------------------------------

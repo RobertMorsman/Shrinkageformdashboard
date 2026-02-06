@@ -16,19 +16,19 @@ st.set_page_config(page_title="Shrinkage Dashboard", layout="wide")
 st.title("📊 Shrinkage Dashboard")
 
 # -----------------------------------------------------------------------------
-# 1) Google Sheets connectie (zelfde sheet als je formulier-app)
+# 1) Google Sheets connectie
+#    - Gebruik st.secrets op Streamlit Cloud
+#    - Fallback: lokaal client_secrets.json
 # -----------------------------------------------------------------------------
 SHEET_KEY = "1DDw-ocdH9MDWTnf6OZG5tlfouURGQcoVaoVUd2pLdv8"
-SHEET_TAB = None  # None = eerste tabblad; of bv. "Sheet1"
+SHEET_TAB = "Blad1"  # exact de tabnaam uit je bestand
 
 @st.cache_resource
 def _gs_client():
-    """Maak 1x een geautoriseerde gspread client. Probeert eerst st.secrets, daarna local file."""
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-
     credentials = None
 
     # 1) Streamlit Cloud secrets (aanbevolen)
@@ -38,7 +38,7 @@ def _gs_client():
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         credentials = Credentials.from_service_account_info(info, scopes=scope)
 
-    # 2) Lokale fallback voor ontwikkeling
+    # 2) Lokale fallback
     elif Path("client_secrets.json").exists():
         with open("client_secrets.json", "r") as f:
             info = json.load(f)
@@ -48,13 +48,12 @@ def _gs_client():
     else:
         st.error(
             "Geen Google‑credentials gevonden. "
-            "Voeg een service account toe in **Settings → Secrets** als `[gcp_service_account]`, "
+            "Zet een service account in **Settings → Secrets** als `[gcp_service_account]`, "
             "of plaats lokaal `client_secrets.json`."
         )
         st.stop()
 
-    client = gspread.authorize(credentials)
-    return client
+    return gspread.authorize(credentials)
 
 # -----------------------------------------------------------------------------
 # 2) Helpers
@@ -64,27 +63,20 @@ def euro(x: float) -> str:
     return f"€ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def parse_money(series: pd.Series) -> pd.Series:
-    """Zet bedragen uit Sheets om naar floats (€, spaties, NBSP, 1.234,56, 1,234.56, etc.)."""
+    """Zet bedragen uit Sheets om naar floats (€, spaties, NBSP, 1.234,56 of 1,234.56)."""
     def _clean(x):
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return 0.0
-        if isinstance(x, (int, float)):
-            return float(x)
+        if x is None or (isinstance(x, float) and pd.isna(x)): return 0.0
+        if isinstance(x, (int, float)): return float(x)
         s = str(x).strip()
-        s = (s.replace("€", "")
-               .replace("EUR", "")
-               .replace("\u00a0", "")  # NBSP
-               .replace(" ", ""))
+        s = (s.replace("€", "").replace("EUR", "")
+               .replace("\u00a0", "").replace(" ", ""))
         if "," in s and "." in s:
-            # NL-stijl met duizendtallen en komma als decimaal: 1.234,56
-            s = s.replace(".", "").replace(",", ".")
+            s = s.replace(".", "").replace(",", ".")      # 1.234,56 → 1234.56
         elif "," in s:
-            # Alleen komma → decimaal
-            s = s.replace(",", ".")
+            s = s.replace(",", ".")                       # 123,45 → 123.45
         else:
-            # Engels met duizendtallen: 1,234.56
-            s = s.replace(",", "")
-        s = re.sub(r"[^0-9\.\-]", "", s)  # laat alleen cijfers, punt, minus over
+            s = s.replace(",", "")                        # 1,234.56 → 1234.56
+        s = re.sub(r"[^0-9\.\-]", "", s)
         try:
             return float(s) if s not in ("", "-", ".") else 0.0
         except Exception:
@@ -124,48 +116,72 @@ def kpi_with_delta(container, label: str, current_val: float, prev_val: float, m
     value_txt = euro(current_val) if money else f"{int(current_val):,}".replace(",", ".")
     container.metric(label, value_txt, delta=delta_txt)
 
+# -----------------------------------------------------------------------------
+# 3) Data laden uit Google Sheet
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_data() -> pd.DataFrame:
-    """Lees records uit Google Sheets en maak ze bruikbaar voor analyses."""
+    """
+    Lees records uit Google Sheets en maak ze bruikbaar voor analyses.
+    Kolommen in jouw tab 'Blad1':
+    Date, Employee, Department, Product, Quantity, Reason, Cost price
+    → mappen we hier naar vaste interne namen.
+    """
     client = _gs_client()
     sh = client.open_by_key(SHEET_KEY)
-    ws = sh.sheet1 if SHEET_TAB is None else sh.worksheet(SHEET_TAB)
+    ws = sh.worksheet(SHEET_TAB) if SHEET_TAB else sh.sheet1
     records = ws.get_all_records()
     df = pd.DataFrame(records)
     if df.empty:
         return df
 
-    # Kolommen normaliseren (verwachte structuur uit je formulier)
+    # ---------- Kolommen normaliseren ----------
+    # exact aansluiten op jouw bestand:
+    # - 'Cost price' (Engels) → intern 'Kostprijs'
     rename_map = {
+        "Date": "Date",
         "Datum": "Date",
+
+        "Employee": "Employee",
         "Medewerker": "Employee",
+
+        "Department": "Department",
         "Afdeling": "Department",
+
+        "Product": "Product",
+
+        "Quantity": "Quantity",
+        "Aantal": "Quantity",
+
+        "Reason": "Reason",
         "Dervingsreden": "Reason",
-        "Kostprijs per stuk": "Kostprijs",
-        "Kostprijs (per stuk)": "Kostprijs",
-        "Totale kost": "TotaleKost",    # voor het geval je ooit een aparte kolom gebruikt
+
+        "Cost price": "Kostprijs",     # <-- jouw header
+        "Cost Price": "Kostprijs",
+        "Kostprijs": "Kostprijs",
+
+        "Totale kost": "TotaleKost",
         "Total Cost": "TotaleKost",
         "Totaal": "TotaleKost",
     }
     df = df.rename(columns=rename_map)
 
     # Zorg dat kolommen bestaan
-    for col in ["Date", "Employee", "Department", "Product", "Quantity", "Reason"]:
+    for col in ["Date", "Employee", "Department", "Product", "Quantity", "Reason", "Kostprijs"]:
         if col not in df.columns:
             df[col] = None
+    if "TotaleKost" not in df.columns:
+        df["TotaleKost"] = 0.0
 
-    # Types & berekeningen
+    # Types & parsing
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).copy()
 
     df["Quantity"] = pd.to_numeric(df.get("Quantity", 0), errors="coerce").fillna(0).astype(float)
     df["Kostprijs"] = parse_money(df.get("Kostprijs", pd.Series(dtype=object))).astype(float)
-    if "TotaleKost" in df.columns:
-        df["TotaleKost"] = parse_money(df["TotaleKost"]).astype(float)
-    else:
-        df["TotaleKost"] = 0.0
+    df["TotaleKost"] = parse_money(df.get("TotaleKost", pd.Series(dtype=object))).astype(float)
 
-    # Altijd ook een berekende variant beschikbaar (qty × per-stuk prijs)
+    # Berekend alternatief (alleen gebruiken als je dat kiest in de UI)
     df["Totaal_calc"] = df["Quantity"] * df["Kostprijs"]
 
     return df
@@ -173,26 +189,24 @@ def load_data() -> pd.DataFrame:
 def assign_total_cost(frame: pd.DataFrame, kost_bron: str) -> pd.DataFrame:
     """Bepaal de kolom 'TotaalKost' in een kopie van frame op basis van de gekozen bron."""
     df2 = frame.copy()
-    if kost_bron.startswith("Gebruik kolom 'Kostprijs'"):
-        # Interpreteer Kostprijs-kolom als het totale bedrag per rij
-        df2["TotaalKost"] = df2["Kostprijs"]
+    if kost_bron.startswith("Gebruik kolom 'Cost price'") or kost_bron.startswith("Gebruik kolom 'Kostprijs'"):
+        df2["TotaalKost"] = df2["Kostprijs"]         # 'Cost price' is totaal per regel
     elif kost_bron.startswith("Quantity × Kostprijs"):
-        df2["TotaalKost"] = df2["Totaal_calc"]
+        df2["TotaalKost"] = df2["Totaal_calc"]       # aantal × (per-stuk)
     else:
-        # Gebruik aparte TotaleKost-kolom als die er is met niet-nul som, otherwise fallback
         if "TotaleKost" in df2.columns and df2["TotaleKost"].abs().sum() > 0:
-            df2["TotaalKost"] = df2["TotaleKost"]
+            df2["TotaalKost"] = df2["TotaleKost"]    # aparte totalen-kolom
         else:
             df2["TotaalKost"] = df2["Totaal_calc"]
     return df2
 
 # -----------------------------------------------------------------------------
-# 3) Data laden
+# 4) Data laden
 # -----------------------------------------------------------------------------
 df = load_data()
 
 # -----------------------------------------------------------------------------
-# 4) Filters (sidebar)
+# 5) Filters (sidebar)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("🔎 Filters")
@@ -220,18 +234,17 @@ with st.sidebar:
     sel_depts = st.multiselect("Winkels/Afdelingen", depts, default=depts)
     sel_reasons = st.multiselect("Dervingsredenen", reasons, default=reasons)
 
-    # ▼ Heel belangrijk: standaard jouw wens (Kostprijs = totaal per rij)
+    # ▼ Standaard: gebruik jouw 'Cost price'/'Kostprijs' als totaal per rij
     kost_bron = st.radio(
         "Bron voor Totale derving:",
         [
-            "Gebruik kolom 'Kostprijs' (interpreteer als totaalbedrag per rij)",
+            "Gebruik kolom 'Cost price' / 'Kostprijs' (interpreteer als totaalbedrag per rij)",
             "Quantity × Kostprijs (per stuk)",
             "Gebruik kolom 'TotaleKost' (als aanwezig in sheet)"
         ],
         index=0
     )
 
-    # Kies wat je in grafieken wilt zien
     metric = st.radio(
         "Te tonen metric",
         ["Totale kost (EUR)", "Aantal meldingen"],
@@ -244,7 +257,7 @@ with st.sidebar:
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 5) Filteren: huidige & vorige periode (voor KPI-delta's)
+# 6) Filteren: huidige & vorige periode (voor KPI-delta's)
 # -----------------------------------------------------------------------------
 mask_now = (
     (df["Date"] >= pd.to_datetime(start_d)) &
@@ -266,15 +279,15 @@ mask_prev = (
 )
 prev_df_raw = df.loc[mask_prev].copy()
 
-# Totale derving bepalen volgens gekozen bron (zowel nu als vorige periode)
+# Kies Totale derving volgens de radio-optie
 now_df = assign_total_cost(now_df_raw, kost_bron)
 prev_df = assign_total_cost(prev_df_raw, kost_bron) if not prev_df_raw.empty else prev_df_raw
 
 # -----------------------------------------------------------------------------
-# 6) KPI's + benchmark (delta)
+# 7) KPI's + benchmark (delta)
 # -----------------------------------------------------------------------------
-current_cost = float(now_df["TotaalKost"].sum())
-current_cnt  = int(now_df.shape[0])  # aantal meldingen (rijen)
+current_cost   = float(now_df["TotaalKost"].sum())
+current_cnt    = int(now_df.shape[0])
 current_stores = int(now_df["Department"].nunique())
 current_products = int(now_df["Product"].nunique())
 
@@ -294,11 +307,11 @@ st.caption(
 st.divider()
 
 # -----------------------------------------------------------------------------
-# 7) Tabs met grafieken en CSV-downloads
+# 8) Tabs met grafieken en CSV-downloads
 # -----------------------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["📅 Per periode", "🏬 Per winkel", "🪪 Per reason", "📋 Details"])
 
-y_col = "TotaalKost" if metric == "Totale kost (EUR)" else "Aantal"
+y_col   = "TotaalKost" if metric == "Totale kost (EUR)" else "Aantal"
 y_title = "Totale derving (EUR)" if y_col == "TotaalKost" else "Aantal meldingen"
 
 with tab1:
@@ -315,10 +328,10 @@ with tab1:
         alt.Chart(agg)
         .mark_line(point=True)
         .encode(
-            x=alt.X("Period:T", title=freq_key),
+            x=alt.X("Period:T", title=f"{freq_key}"),
             y=alt.Y(f"{y_col}:Q", title=y_title),
             tooltip=[
-                alt.Tooltip("Period:T", title=freq_key),
+                alt.Tooltip("Period:T", title=f"{freq_key}"),
                 alt.Tooltip("TotaalKost:Q", title="Derving (EUR)", format=",.2f"),
                 alt.Tooltip("Aantal:Q", title="Meldingen"),
             ],
@@ -413,11 +426,3 @@ with tab4:
         file_name="derving_details_gefilterd.csv",
         mime="text/csv",
     )
-
-# -----------------------------------------------------------------------------
-# (Optioneel) Debug totals
-# -----------------------------------------------------------------------------
-# with st.expander("🔧 Debug totals (tijdelijk)"):
-#     st.write("Som Kostprijs:", now_df["Kostprijs"].sum())
-#     st.write("Som Totaal_calc (qty × prijs):", now_df["Totaal_calc"].sum())
-#     st.write("Som TotaalKost (gebruikt):", now_df["TotaalKost"].sum())

@@ -31,16 +31,61 @@ def _gs_client():
     client = gspread.authorize(credentials)
     return client
 
+
 @st.cache_data(ttl=300)
 def load_data() -> pd.DataFrame:
-    """Lees records uit Google Sheets en maak ze bruikbaar voor analyses."""
     client = _gs_client()
     sh = client.open_by_key(SHEET_KEY)
     ws = sh.sheet1 if SHEET_TAB is None else sh.worksheet(SHEET_TAB)
-    records = ws.get_all_records()  # lijst van dicts
+    records = ws.get_all_records()
     df = pd.DataFrame(records)
     if df.empty:
         return df
+
+    # Normaliseer kolomnamen
+    rename_map = {
+        "Datum": "Date",
+        "Medewerker": "Employee",
+        "Afdeling": "Department",
+        "Dervingsreden": "Reason",
+        "Kostprijs per stuk": "Kostprijs",
+        "Kostprijs (per stuk)": "Kostprijs",
+        "Totale kost": "TotaleKost",        # als die eventueel bestaat
+        "Total Cost": "TotaleKost",
+        "Totaal": "TotaleKost",
+    }
+    df = df.rename(columns=rename_map)
+    for col in ["Date", "Employee", "Department", "Product", "Quantity", "Reason"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Types
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).copy()
+
+    # Quantity
+    if "Quantity" in df.columns:
+        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0).astype(float)
+    else:
+        df["Quantity"] = 0.0
+
+    # Kostprijs (kan per-stuk of totaal zijn in jouw sheet)
+    if "Kostprijs" in df.columns:
+        df["Kostprijs"] = parse_money(df["Kostprijs"])
+    else:
+        df["Kostprijs"] = 0.0
+
+    # Als de sheet een aparte totale-kolom heeft, parse die ook
+    if "TotaleKost" in df.columns:
+        df["TotaleKost"] = parse_money(df["TotaleKost"])
+    else:
+        df["TotaleKost"] = 0.0
+
+    # Bewaar ook een “calculated” variant voor het geval je Quantity × Kostprijs wilt
+    df["Totaal_calc"] = df["Quantity"] * df["Kostprijs"]
+
+    return df
+
 
     # Kolommen normaliseren (verwachte structuur uit de invoer-app)
     rename_map = {
@@ -71,8 +116,36 @@ df = load_data()
 # -----------------------------------------------------------------------------
 # 2) Hulpfuncties
 # -----------------------------------------------------------------------------
-def euro(x: float) -> str:
-    return f"€ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def parse_money(series: pd.Series) -> pd.Series:
+    """Zet bedragen uit Sheets om naar floats.
+    Herkent €-symbool, non-breaking spaces, duizendtallen en NL decimalen."""
+    def _clean(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        # verwijder € en overige currency-tekens, NBSP, normale spaties
+        s = s.replace("€", "").replace("EUR", "").replace("\xa0", "").replace(" ", "")
+        # Als er zowel punt als komma in zit, beschouw punt als duizendscheiding en komma als decimaal
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        # Als er alleen een komma in zit, beschouw die als decimaal
+        elif "," in s:
+            s = s.replace(",", ".")
+        # Anders is het al een 'engelse' float met optionele duizendtallen (bv 1,234.56) → haal komma's weg
+        else:
+            s = s.replace(",", "")
+        # Laat alleen cijfers, minteken en punt over
+        s = re.sub(r"[^0-9\.\-]", "", s)
+        try:
+            return float(s) if s not in ("", "-", ".") else 0.0
+        except Exception:
+            return 0.0
+
+    return series.apply(_clean)
+
 
 def previous_period(start_d: date, end_d: date) -> tuple[date, date]:
     """Vorige periode met exact dezelfde lengte direct vóór de huidige."""
@@ -126,7 +199,17 @@ with st.sidebar:
         min_value=min_d, max_value=max_d,
         format="DD-MM-YYYY",
     )
-
+    
+    kost_bron = st.radio(
+    "Bron voor Totale derving:",
+    [
+        "Gebruik kolom 'Kostprijs' (interpreteer als totaalbedrag per rij)",
+        "Quantity × Kostprijs (per stuk)",
+        "Gebruik kolom 'TotaleKost' (als aanwezig in sheet)"
+    ],
+    index=0  # jouw wens: standaard 'Kostprijs' als totaal
+    )
+    
     freq_key = st.selectbox("Tijdsgroepering", ["Week", "Maand", "Kwartaal", "Jaar"], index=1)
 
     depts = sorted([d for d in df["Department"].dropna().unique()])
@@ -170,6 +253,17 @@ mask_prev = (
 )
 prev_df = df.loc[mask_prev].copy()
 
+# fdf = gefilterde dataframe (zoals je al had)
+if kost_bron.startswith("Gebruik kolom 'Kostprijs'"):
+    fdf["TotaalKost"] = fdf["Kostprijs"]  # direct optellen uit Kostprijs-kolom
+elif kost_bron.startswith("Quantity × Kostprijs"):
+    fdf["TotaalKost"] = fdf["Totaal_calc"]  # Quantity * Kostprijs
+else:
+    # Gebruik aparte kolom 'TotaleKost' als die er is; anders fallback naar calculated
+    if "TotaleKost" in fdf.columns and fdf["TotaleKost"].sum() > 0:
+        fdf["TotaalKost"] = fdf["TotaleKost"]
+    else:
+        fdf["TotaalKost"] = fdf["Totaal_calc"]
 # -----------------------------------------------------------------------------
 # 5) KPI's + benchmark (delta)
 # -----------------------------------------------------------------------------

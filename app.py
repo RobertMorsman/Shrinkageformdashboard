@@ -216,15 +216,15 @@ with st.sidebar:
         st.stop()
 
     min_d = df["Date"].min().date()
-    max_d = df["Date"].max().date()
+    max_d = date.today()          # ← allow selecting any date up to today
 
     start_d, end_d = st.date_input(
-        "Periode",
-        value=(min_d, max_d),
-        min_value=min_d,
-        max_value=max_d,
-        format="DD-MM-YYYY",
-    )
+    "Periode",
+    value=(min_d, df["Date"].max().date()),   # default end = last data date
+    min_value=min_d,
+    max_value=max_d,          # now = today, not last sheet row
+    format="DD-MM-YYYY",
+)
 
     freq_key = st.selectbox("Tijdsgroepering", ["Week", "Maand", "Kwartaal", "Jaar"], index=1)
 

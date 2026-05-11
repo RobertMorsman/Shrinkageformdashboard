@@ -135,6 +135,24 @@ def load_data() -> pd.DataFrame:
     if df.empty:
         return df
 
+@st.cache_data
+def load_options() -> dict:
+    """
+    Laad vaste opties (redenen, afdelingen, producten) uit options.xlsx.
+    Wordt gecached — herlaadt alleen bij een nieuwe deploy of cache-clear.
+    """
+    xl = pd.ExcelFile("options-dash.xlsx")
+    df_opts = xl.parse("Kostprijs_berekend")  # de eerste sheet
+
+    reasons = sorted(
+        df_opts["Dervingsreden"].dropna().unique().tolist()
+    )
+    departments = sorted(
+        df_opts["Department"].dropna().unique().tolist()
+    ) if "Department" in df_opts.columns else []
+
+    return {"reasons": reasons, "departments": departments}
+
     # ---------- Kolommen normaliseren ----------
     # exact aansluiten op jouw bestand:
     # - 'Cost price' (Engels) → intern 'Kostprijs'
@@ -228,8 +246,9 @@ with st.sidebar:
 
     freq_key = st.selectbox("Tijdsgroepering", ["Week", "Maand", "Kwartaal", "Jaar"], index=1)
 
+    options = load_options()
+    reasons = options["reasons"]          # uit options.xlsx — altijd compleet
     depts = sorted([d for d in df["Department"].dropna().unique()])
-    reasons = sorted([r for r in df["Reason"].dropna().unique()])
 
     sel_depts = st.multiselect("Winkels/Afdelingen", depts, default=depts)
     sel_reasons = st.multiselect("Dervingsredenen", reasons, default=reasons)

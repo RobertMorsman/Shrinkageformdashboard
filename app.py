@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -29,38 +29,29 @@ def _gs_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
+    credentials = None
 
+    # 1) Streamlit Cloud secrets (aanbevolen)
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
-        
-        # Robustly fix the private key — handles all known Streamlit secret formats
-        pk = info.get("private_key", "")
-        pk = pk.replace("\\n", "\n")          # literal \n → real newline
-        pk = pk.replace("\r\n", "\n")         # Windows line endings
-        pk = pk.replace("\r", "\n")           # old Mac line endings
-        # Ensure PEM header/footer are on their own lines
-        pk = pk.replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----\n")
-        pk = pk.replace("-----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----\n")
-        pk = pk.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
-        pk = pk.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----\n")
-        # Remove duplicate newlines that may have been introduced
-        import re as _re
-        pk = _re.sub(r"\n{2,}", "\n", pk).strip() + "\n"
-        info["private_key"] = pk
-
+        if "private_key" in info:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
         credentials = Credentials.from_service_account_info(info, scopes=scope)
 
+    # 2) Lokale fallback
     elif Path("client_secrets.json").exists():
         with open("client_secrets.json", "r") as f:
             info = json.load(f)
-        info["private_key"] = info["private_key"].replace("\\n", "\n")
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
         credentials = Credentials.from_service_account_info(info, scopes=scope)
 
     else:
-        raise RuntimeError(
+        st.error(
             "Geen Google‑credentials gevonden. "
-            "Zet een service account in Settings → Secrets als [gcp_service_account]."
+            "Zet een service account in **Settings → Secrets** als `[gcp_service_account]`, "
+            "of plaats lokaal `client_secrets.json`."
         )
+        st.stop()
 
     return gspread.authorize(credentials)
 
@@ -144,24 +135,6 @@ def load_data() -> pd.DataFrame:
     if df.empty:
         return df
 
-@st.cache_data
-def load_options() -> dict:
-    """
-    Laad vaste opties (redenen, afdelingen, producten) uit options.xlsx.
-    Wordt gecached — herlaadt alleen bij een nieuwe deploy of cache-clear.
-    """
-    xl = pd.ExcelFile("options-dash.xlsx")
-    df_opts = xl.parse("Kostprijs_berekend")  # de eerste sheet
-
-    reasons = sorted(
-        df_opts["Dervingsreden"].dropna().unique().tolist()
-    )
-    departments = sorted(
-        df_opts["Department"].dropna().unique().tolist()
-    ) if "Department" in df_opts.columns else []
-
-    return {"reasons": reasons, "departments": departments}
-
     # ---------- Kolommen normaliseren ----------
     # exact aansluiten op jouw bestand:
     # - 'Cost price' (Engels) → intern 'Kostprijs'
@@ -231,19 +204,6 @@ def assign_total_cost(frame: pd.DataFrame, kost_bron: str) -> pd.DataFrame:
 # 4) Data laden
 # -----------------------------------------------------------------------------
 df = load_data()
-if df is None:
-    st.error("Kon geen verbinding maken met Google Sheets. Controleer de credentials in Secrets.")
-    st.stop()
-
-try:
-    df = load_data()
-except RuntimeError as e:
-    st.error(str(e))
-    st.stop()
-
-if df is None or df.empty:
-    st.error("Geen data ontvangen van Google Sheets.")
-    st.stop()
 
 # -----------------------------------------------------------------------------
 # 5) Filters (sidebar)
@@ -268,9 +228,8 @@ with st.sidebar:
 
     freq_key = st.selectbox("Tijdsgroepering", ["Week", "Maand", "Kwartaal", "Jaar"], index=1)
 
-    options = load_options()
-    reasons = options["reasons"]          # uit options.xlsx — altijd compleet
     depts = sorted([d for d in df["Department"].dropna().unique()])
+    reasons = sorted([r for r in df["Reason"].dropna().unique()])
 
     sel_depts = st.multiselect("Winkels/Afdelingen", depts, default=depts)
     sel_reasons = st.multiselect("Dervingsredenen", reasons, default=reasons)

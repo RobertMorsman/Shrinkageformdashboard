@@ -29,29 +29,38 @@ def _gs_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = None
 
-    # 1) Streamlit Cloud secrets (aanbevolen)
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
-        if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        
+        # Robustly fix the private key — handles all known Streamlit secret formats
+        pk = info.get("private_key", "")
+        pk = pk.replace("\\n", "\n")          # literal \n → real newline
+        pk = pk.replace("\r\n", "\n")         # Windows line endings
+        pk = pk.replace("\r", "\n")           # old Mac line endings
+        # Ensure PEM header/footer are on their own lines
+        pk = pk.replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----\n")
+        pk = pk.replace("-----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----\n")
+        pk = pk.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+        pk = pk.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----\n")
+        # Remove duplicate newlines that may have been introduced
+        import re as _re
+        pk = _re.sub(r"\n{2,}", "\n", pk).strip() + "\n"
+        info["private_key"] = pk
+
         credentials = Credentials.from_service_account_info(info, scopes=scope)
 
-    # 2) Lokale fallback
     elif Path("client_secrets.json").exists():
         with open("client_secrets.json", "r") as f:
             info = json.load(f)
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
         credentials = Credentials.from_service_account_info(info, scopes=scope)
 
     else:
         raise RuntimeError(
             "Geen Google‑credentials gevonden. "
-            "Zet een service account in Settings → Secrets als [gcp_service_account], "
-            "of plaats lokaal client_secrets.json."
+            "Zet een service account in Settings → Secrets als [gcp_service_account]."
         )
-        st.stop()
 
     return gspread.authorize(credentials)
 

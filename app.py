@@ -46,10 +46,10 @@ def _gs_client():
         credentials = Credentials.from_service_account_info(info, scopes=scope)
 
     else:
-        st.error(
+        raise RuntimeError(
             "Geen Google‑credentials gevonden. "
-            "Zet een service account in **Settings → Secrets** als `[gcp_service_account]`, "
-            "of plaats lokaal `client_secrets.json`."
+            "Zet een service account in Settings → Secrets als [gcp_service_account], "
+            "of plaats lokaal client_secrets.json."
         )
         st.stop()
 
@@ -222,6 +222,19 @@ def assign_total_cost(frame: pd.DataFrame, kost_bron: str) -> pd.DataFrame:
 # 4) Data laden
 # -----------------------------------------------------------------------------
 df = load_data()
+if df is None:
+    st.error("Kon geen verbinding maken met Google Sheets. Controleer de credentials in Secrets.")
+    st.stop()
+
+try:
+    df = load_data()
+except RuntimeError as e:
+    st.error(str(e))
+    st.stop()
+
+if df is None or df.empty:
+    st.error("Geen data ontvangen van Google Sheets.")
+    st.stop()
 
 # -----------------------------------------------------------------------------
 # 5) Filters (sidebar)

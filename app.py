@@ -1,13 +1,26 @@
-
-import streamlit as st
-import pandas as pd
-import altair as alt
 import json
-import gspread
-import re
+from datetime import date
 from pathlib import Path
-from datetime import date, timedelta
+
+import altair as alt
+import gspread
+import pandas as pd
+import streamlit as st
 from google.oauth2.service_account import Credentials
+
+from shrinkage import (
+    COST_SOURCES,
+    FREQUENCIES,
+    aggregate,
+    assign_total_cost,
+    delta_text,
+    euro,
+    filter_frame,
+    fmt_int,
+    make_period_col,
+    normalize,
+    previous_period,
+)
 
 # -----------------------------------------------------------------------------
 # Pagina-config
@@ -22,29 +35,28 @@ st.title("📊 Shrinkage Dashboard")
 # -----------------------------------------------------------------------------
 SHEET_KEY = "1DDw-ocdH9MDWTnf6OZG5tlfouURGQcoVaoVUd2pLdv8"
 SHEET_TAB = "Blad1"  # exact de tabnaam uit je bestand
+LOCAL_CREDENTIALS = Path(__file__).parent / "client_secrets.json"
+
+# Dashboard leest alleen: read-only scope is voldoende
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+
+def _has_secret(key: str) -> bool:
+    # st.secrets gooit een fout als er helemaal geen secrets.toml bestaat
+    try:
+        return key in st.secrets
+    except Exception:
+        return False
+
 
 @st.cache_resource
 def _gs_client():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials = None
-
     # 1) Streamlit Cloud secrets (aanbevolen)
-    if "gcp_service_account" in st.secrets:
+    if _has_secret("gcp_service_account"):
         info = dict(st.secrets["gcp_service_account"])
-        if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-        credentials = Credentials.from_service_account_info(info, scopes=scope)
-
     # 2) Lokale fallback
-    elif Path("client_secrets.json").exists():
-        with open("client_secrets.json", "r") as f:
-            info = json.load(f)
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-        credentials = Credentials.from_service_account_info(info, scopes=scope)
-
+    elif LOCAL_CREDENTIALS.exists():
+        info = json.loads(LOCAL_CREDENTIALS.read_text())
     else:
         st.error(
             "Geen Google‑credentials gevonden. "
@@ -53,160 +65,53 @@ def _gs_client():
         )
         st.stop()
 
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(credentials)
 
-# -----------------------------------------------------------------------------
-# 2) Helpers
-# -----------------------------------------------------------------------------
-def euro(x: float) -> str:
-    """Formatteer getal als Europese euro-notatie."""
-    return f"€ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def parse_money(series: pd.Series) -> pd.Series:
-    """Zet bedragen uit Sheets om naar floats (€, spaties, NBSP, 1.234,56 of 1,234.56)."""
-    def _clean(x):
-        if x is None or (isinstance(x, float) and pd.isna(x)): return 0.0
-        if isinstance(x, (int, float)): return float(x)
-        s = str(x).strip()
-        s = (s.replace("€", "").replace("EUR", "")
-               .replace("\u00a0", "").replace(" ", ""))
-        if "," in s and "." in s:
-            s = s.replace(".", "").replace(",", ".")      # 1.234,56 → 1234.56
-        elif "," in s:
-            s = s.replace(",", ".")                       # 123,45 → 123.45
-        else:
-            s = s.replace(",", "")                        # 1,234.56 → 1234.56
-        s = re.sub(r"[^0-9\.\-]", "", s)
-        try:
-            return float(s) if s not in ("", "-", ".") else 0.0
-        except Exception:
-            return 0.0
-    return series.apply(_clean)
-
-def previous_period(start_d: date, end_d: date) -> tuple[date, date]:
-    """Vorige periode met exact dezelfde lengte direct vóór de huidige."""
-    length = (end_d - start_d).days + 1  # inclusief
-    prev_end = start_d - timedelta(days=1)
-    prev_start = prev_end - timedelta(days=length - 1)
-    return prev_start, prev_end
-
-def make_period_col(frame: pd.DataFrame, freq_key: str) -> pd.DataFrame:
-    """Voeg 'Period' toe obv gekozen frequentie (Week/Maand/Kwartaal/Jaar)."""
-    frame = frame.copy()
-    if freq_key == "Week":
-        p = frame["Date"].dt.to_period("W-MON")
-        frame["Period"] = p.apply(lambda r: r.start_time)  # maandag als start
-    elif freq_key == "Maand":
-        frame["Period"] = frame["Date"].dt.to_period("M").dt.to_timestamp()
-    elif freq_key == "Kwartaal":
-        frame["Period"] = frame["Date"].dt.to_period("Q").dt.to_timestamp()
-    elif freq_key == "Jaar":
-        frame["Period"] = frame["Date"].dt.to_period("Y").dt.to_timestamp()
-    else:
-        frame["Period"] = frame["Date"]
-    return frame
-
-def kpi_with_delta(container, label: str, current_val: float, prev_val: float, money: bool):
-    delta_val = current_val - prev_val
-    if prev_val:
-        pct = (delta_val / prev_val) * 100
-        delta_txt = f"{'+' if delta_val >= 0 else ''}{euro(delta_val) if money else f'{int(delta_val):,}'.replace(',', '.')} ({pct:+.1f}%)"
-    else:
-        delta_txt = f"{'+' if delta_val >= 0 else ''}{euro(delta_val) if money else f'{int(delta_val):,}'.replace(',', '.')}"
-    value_txt = euro(current_val) if money else f"{int(current_val):,}".replace(",", ".")
-    # 🔴⬆️ rood bij stijging, 🟢⬇️ groen bij daling
-    container.metric(label, value_txt, delta=delta_txt, delta_color="inverse")
 # -----------------------------------------------------------------------------
-# 3) Data laden uit Google Sheet
+# 2) Data laden uit Google Sheet
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300, show_spinner="Data laden uit Google Sheets…")
 def load_data() -> pd.DataFrame:
     """
     Lees records uit Google Sheets en maak ze bruikbaar voor analyses.
-    Kolommen in jouw tab 'Blad1':
+    Kolommen in tab 'Blad1':
     Date, Employee, Department, Product, Quantity, Reason, Cost price
-    → mappen we hier naar vaste interne namen.
+    → gemapt naar vaste interne namen (zie shrinkage.RENAME_MAP).
     """
     client = _gs_client()
     sh = client.open_by_key(SHEET_KEY)
     ws = sh.worksheet(SHEET_TAB) if SHEET_TAB else sh.sheet1
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(ws.get_all_records())
     if df.empty:
         return df
+    return normalize(df)
 
-    # ---------- Kolommen normaliseren ----------
-    # exact aansluiten op jouw bestand:
-    # - 'Cost price' (Engels) → intern 'Kostprijs'
-    rename_map = {
-        "Date": "Date",
-        "Datum": "Date",
 
-        "Employee": "Employee",
-        "Medewerker": "Employee",
+def kpi_with_delta(container, label: str, current_val: float, prev_val: float, money: bool):
+    value_txt = euro(current_val) if money else fmt_int(current_val)
+    # 🔴⬆️ rood bij stijging, 🟢⬇️ groen bij daling
+    container.metric(label, value_txt, delta=delta_text(current_val, prev_val, money),
+                     delta_color="inverse")
 
-        "Department": "Department",
-        "Afdeling": "Department",
 
-        "Product": "Product",
-
-        "Quantity": "Quantity",
-        "Aantal": "Quantity",
-
-        "Reason": "Reason",
-        "Dervingsreden": "Reason",
-
-        "Cost price": "Kostprijs",     # <-- jouw header
-        "Cost Price": "Kostprijs",
-        "Kostprijs": "Kostprijs",
-
-        "Totale kost": "TotaleKost",
-        "Total Cost": "TotaleKost",
-        "Totaal": "TotaleKost",
-    }
-    df = df.rename(columns=rename_map)
-
-    # Zorg dat kolommen bestaan
-    for col in ["Date", "Employee", "Department", "Product", "Quantity", "Reason", "Kostprijs"]:
-        if col not in df.columns:
-            df[col] = None
-    if "TotaleKost" not in df.columns:
-        df["TotaleKost"] = 0.0
-
-    # Types & parsing
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).copy()
-
-    df["Quantity"] = pd.to_numeric(df.get("Quantity", 0), errors="coerce").fillna(0).astype(float)
-    df["Kostprijs"] = parse_money(df.get("Kostprijs", pd.Series(dtype=object))).astype(float)
-    df["TotaleKost"] = parse_money(df.get("TotaleKost", pd.Series(dtype=object))).astype(float)
-
-    # Berekend alternatief (alleen gebruiken als je dat kiest in de UI)
-    df["Totaal_calc"] = df["Quantity"] * df["Kostprijs"]
-
-    return df
-
-def assign_total_cost(frame: pd.DataFrame, kost_bron: str) -> pd.DataFrame:
-    """Bepaal de kolom 'TotaalKost' in een kopie van frame op basis van de gekozen bron."""
-    df2 = frame.copy()
-    if kost_bron.startswith("Gebruik kolom 'Cost price'") or kost_bron.startswith("Gebruik kolom 'Kostprijs'"):
-        df2["TotaalKost"] = df2["Kostprijs"]         # 'Cost price' is totaal per regel
-    elif kost_bron.startswith("Quantity × Kostprijs"):
-        df2["TotaalKost"] = df2["Totaal_calc"]       # aantal × (per-stuk)
-    else:
-        if "TotaleKost" in df2.columns and df2["TotaleKost"].abs().sum() > 0:
-            df2["TotaalKost"] = df2["TotaleKost"]    # aparte totalen-kolom
-        else:
-            df2["TotaalKost"] = df2["Totaal_calc"]
-    return df2
+try:
+    df = load_data()
+except gspread.exceptions.SpreadsheetNotFound:
+    st.error("Google Sheet niet gevonden. Is de sheet gedeeld met het service-account e-mailadres?")
+    st.stop()
+except gspread.exceptions.WorksheetNotFound:
+    st.error(f"Tabblad '{SHEET_TAB}' niet gevonden in de Google Sheet.")
+    st.stop()
+except Exception as e:  # netwerk / API / credentials
+    st.error(f"Kon data niet laden uit Google Sheets: {e}")
+    st.stop()
 
 # -----------------------------------------------------------------------------
-# 4) Data laden
-# -----------------------------------------------------------------------------
-df = load_data()
-
-# -----------------------------------------------------------------------------
-# 5) Filters (sidebar)
+# 3) Filters (sidebar)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("🔎 Filters")
@@ -216,40 +121,45 @@ with st.sidebar:
         st.stop()
 
     min_d = df["Date"].min().date()
-    max_d = date.today()          # ← allow selecting any date up to today
+    max_data_d = df["Date"].max().date()
+    max_d = max(date.today(), max_data_d)   # selecteren mag t/m vandaag
 
-    start_d, end_d = st.date_input(
-    "Periode",
-    value=(min_d, df["Date"].max().date()),   # default end = last data date
-    min_value=min_d,
-    max_value=max_d,          # now = today, not last sheet row
-    format="DD-MM-YYYY",
-)
+    period = st.date_input(
+        "Periode",
+        value=(min_d, max_data_d),           # standaard eind = laatste datum in data
+        min_value=min_d,
+        max_value=max_d,
+        format="DD-MM-YYYY",
+    )
+    # Tijdens het kiezen van een bereik geeft Streamlit eerst maar één datum terug
+    if isinstance(period, (tuple, list)):
+        start_d, end_d = (period[0], period[-1]) if period else (min_d, max_data_d)
+    else:
+        start_d = end_d = period
 
-    freq_key = st.selectbox("Tijdsgroepering", ["Week", "Maand", "Kwartaal", "Jaar"], index=1)
+    freq_key = st.selectbox("Tijdsgroepering", FREQUENCIES, index=1)
 
-    depts = sorted([d for d in df["Department"].dropna().unique()])
-    reasons = sorted([r for r in df["Reason"].dropna().unique()])
+    depts = sorted(df["Department"].dropna().astype(str).unique())
+    reasons = sorted(df["Reason"].dropna().astype(str).unique())
 
-    sel_depts = st.multiselect("Winkels/Afdelingen", depts, default=depts)
-    sel_reasons = st.multiselect("Dervingsredenen", reasons, default=reasons)
+    sel_depts = st.multiselect("Winkels/Afdelingen", depts, default=depts,
+                               help="Leeg = alle winkels/afdelingen.")
+    sel_reasons = st.multiselect("Dervingsredenen", reasons, default=reasons,
+                                 help="Leeg = alle redenen.")
 
-    # ▼ Standaard: gebruik jouw 'Cost price'/'Kostprijs' als totaal per rij
+    # Standaard: 'Cost price'/'Kostprijs' als totaal per rij
     kost_bron = st.radio(
         "Bron voor Totale derving:",
-        [
-            "Gebruik kolom 'Cost price' / 'Kostprijs' (interpreteer als totaalbedrag per rij)",
-            "Quantity × Kostprijs (per stuk)",
-            "Gebruik kolom 'TotaleKost' (als aanwezig in sheet)"
-        ],
-        index=0
+        list(COST_SOURCES),
+        format_func=COST_SOURCES.get,
+        index=0,
     )
 
     metric = st.radio(
         "Te tonen metric",
         ["Totale kost (EUR)", "Aantal meldingen"],
         index=0,
-        help="Toon totale dervingskosten of aantal meldingen."
+        help="Toon totale dervingskosten of aantal meldingen.",
     )
 
     if st.button("↻ Data verversen"):
@@ -257,48 +167,28 @@ with st.sidebar:
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 6) Filteren: huidige & vorige periode (voor KPI-delta's)
+# 4) Filteren: huidige & vorige periode (voor KPI-delta's)
 # -----------------------------------------------------------------------------
-mask_now = (
-    (df["Date"] >= pd.to_datetime(start_d)) &
-    (df["Date"] <= pd.to_datetime(end_d)) &
-    (df["Department"].isin(sel_depts) if sel_depts else True) &
-    (df["Reason"].isin(sel_reasons) if sel_reasons else True)
-)
-now_df_raw = df.loc[mask_now].copy()
-if now_df_raw.empty:
+now_df = filter_frame(df, start_d, end_d, sel_depts, sel_reasons)
+if now_df.empty:
     st.warning("Geen resultaten voor de huidige filters.")
     st.stop()
 
 prev_start, prev_end = previous_period(start_d, end_d)
-mask_prev = (
-    (df["Date"] >= pd.to_datetime(prev_start)) &
-    (df["Date"] <= pd.to_datetime(prev_end)) &
-    (df["Department"].isin(sel_depts) if sel_depts else True) &
-    (df["Reason"].isin(sel_reasons) if sel_reasons else True)
-)
-prev_df_raw = df.loc[mask_prev].copy()
+prev_df = filter_frame(df, prev_start, prev_end, sel_depts, sel_reasons)
 
-# Kies Totale derving volgens de radio-optie
-now_df = assign_total_cost(now_df_raw, kost_bron)
-prev_df = assign_total_cost(prev_df_raw, kost_bron) if not prev_df_raw.empty else prev_df_raw
+now_df = assign_total_cost(now_df, kost_bron)
+prev_df = assign_total_cost(prev_df, kost_bron)
 
 # -----------------------------------------------------------------------------
-# 7) KPI's + benchmark (delta)
+# 5) KPI's + benchmark (delta)
 # -----------------------------------------------------------------------------
-current_cost   = float(now_df["TotaalKost"].sum())
-current_cnt    = int(now_df.shape[0])
-current_stores = int(now_df["Department"].nunique())
-current_products = int(now_df["Product"].nunique())
-
-prev_cost = float(prev_df["TotaalKost"].sum()) if not prev_df.empty else 0.0
-prev_cnt  = int(prev_df.shape[0]) if not prev_df.empty else 0
-
 c1, c2, c3, c4 = st.columns(4)
-kpi_with_delta(c1, "Totale derving (EUR)", current_cost, prev_cost, money=True)
-kpi_with_delta(c2, "Aantal meldingen",     current_cnt,  prev_cnt,  money=False)
-c3.metric("Unieke winkels", f"{current_stores}")
-c4.metric("Unieke producten", f"{current_products}")
+kpi_with_delta(c1, "Totale derving (EUR)", float(now_df["TotaalKost"].sum()),
+               float(prev_df["TotaalKost"].sum()), money=True)
+kpi_with_delta(c2, "Aantal meldingen", len(now_df), len(prev_df), money=False)
+c3.metric("Unieke winkels", f"{now_df['Department'].nunique()}")
+c4.metric("Unieke producten", f"{now_df['Product'].nunique()}")
 
 st.caption(
     f"Benchmark vs. vorige periode: {prev_start.strftime('%d-%m-%Y')} t/m {prev_end.strftime('%d-%m-%Y')} "
@@ -307,122 +197,93 @@ st.caption(
 st.divider()
 
 # -----------------------------------------------------------------------------
-# 8) Tabs met grafieken en CSV-downloads
+# 6) Tabs met grafieken en CSV-downloads
 # -----------------------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["📅 Per periode", "🏬 Per winkel", "🪪 Per reason", "📋 Details"])
 
-y_col   = "TotaalKost" if metric == "Totale kost (EUR)" else "Aantal"
+y_col = "TotaalKost" if metric == "Totale kost (EUR)" else "Aantal"
 y_title = "Totale derving (EUR)" if y_col == "TotaalKost" else "Aantal meldingen"
 
-with tab1:
-    # Per periode (volgt freq_key)
-    tdf = make_period_col(now_df, freq_key)
-    agg = (
-        tdf.groupby("Period")
-        .agg(TotaalKost=("TotaalKost", "sum"), Aantal=("Product", "size"))
-        .reset_index()
-        .sort_values("Period")
+
+def _tooltip(dim: str, dim_type: str, title: str) -> list:
+    return [
+        alt.Tooltip(f"{dim}:{dim_type}", title=title),
+        alt.Tooltip("TotaalKost:Q", title="Derving (EUR)", format=",.2f"),
+        alt.Tooltip("Aantal:Q", title="Meldingen"),
+    ]
+
+
+def _csv(frame: pd.DataFrame) -> bytes:
+    # utf-8-sig zodat Excel € en accenten goed toont
+    return frame.to_csv(index=False).encode("utf-8-sig")
+
+
+def bar_tab(dim: str, title: str, color: str, file_name: str):
+    data = aggregate(now_df, dim).sort_values(y_col, ascending=False)
+    chart = (
+        alt.Chart(data)
+        .mark_bar()
+        .encode(
+            y=alt.Y(f"{dim}:N", sort="-x", title=title),
+            x=alt.X(f"{y_col}:Q", title=y_title),
+            tooltip=_tooltip(dim, "N", title),
+            color=alt.value(color),
+        )
+        .properties(height=max(300, 28 * len(data)))
+    )
+    st.altair_chart(chart, width="stretch")
+    st.download_button(
+        f"⬇️ Download CSV: per {title.lower()}",
+        data=_csv(data),
+        file_name=file_name,
+        mime="text/csv",
     )
 
+
+with tab1:
+    agg = aggregate(make_period_col(now_df, freq_key), "Period").sort_values("Period")
     chart = (
         alt.Chart(agg)
         .mark_line(point=True)
         .encode(
-            x=alt.X("Period:T", title=f"{freq_key}"),
+            x=alt.X("Period:T", title=freq_key),
             y=alt.Y(f"{y_col}:Q", title=y_title),
-            tooltip=[
-                alt.Tooltip("Period:T", title=f"{freq_key}"),
-                alt.Tooltip("TotaalKost:Q", title="Derving (EUR)", format=",.2f"),
-                alt.Tooltip("Aantal:Q", title="Meldingen"),
-            ],
+            tooltip=_tooltip("Period", "T", freq_key),
             color=alt.value("#6A5ACD"),
         )
         .properties(height=350)
     )
-    st.altair_chart(chart, use_container_width=True)
-
+    st.altair_chart(chart, width="stretch")
     st.download_button(
         "⬇️ Download CSV: aggregatie per periode",
-        data=agg.to_csv(index=False).encode("utf-8"),
+        data=_csv(agg),
         file_name=f"derving_per_{freq_key.lower()}.csv",
         mime="text/csv",
     )
 
 with tab2:
-    # Per winkel
-    by_dept = (
-        now_df.groupby("Department", dropna=True)
-        .agg(TotaalKost=("TotaalKost", "sum"), Aantal=("Product", "size"))
-        .reset_index()
-    )
-    by_dept = by_dept.sort_values("TotaalKost" if y_col == "TotaalKost" else "Aantal", ascending=False)
-
-    chart = (
-        alt.Chart(by_dept)
-        .mark_bar()
-        .encode(
-            y=alt.Y("Department:N", sort="-x", title="Winkel/Afdeling"),
-            x=alt.X(f"{y_col}:Q", title=y_title),
-            tooltip=[
-                alt.Tooltip("Department:N", title="Winkel"),
-                alt.Tooltip("TotaalKost:Q", title="Derving (EUR)", format=",.2f"),
-                alt.Tooltip("Aantal:Q", title="Meldingen"),
-            ],
-            color=alt.value("#00A99D"),
-        )
-        .properties(height=500)
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-    st.download_button(
-        "⬇️ Download CSV: per winkel",
-        data=by_dept.to_csv(index=False).encode("utf-8"),
-        file_name="derving_per_winkel.csv",
-        mime="text/csv",
-    )
+    bar_tab("Department", "Winkel/Afdeling", "#00A99D", "derving_per_winkel.csv")
 
 with tab3:
-    # Per reason
-    by_reason = (
-        now_df.groupby("Reason", dropna=True)
-        .agg(TotaalKost=("TotaalKost", "sum"), Aantal=("Product", "size"))
-        .reset_index()
-    )
-    by_reason = by_reason.sort_values("TotaalKost" if y_col == "TotaalKost" else "Aantal", ascending=False)
-
-    chart = (
-        alt.Chart(by_reason)
-        .mark_bar()
-        .encode(
-            y=alt.Y("Reason:N", sort="-x", title="Dervingsreden"),
-            x=alt.X(f"{y_col}:Q", title=y_title),
-            tooltip=[
-                alt.Tooltip("Reason:N", title="Reason"),
-                alt.Tooltip("TotaalKost:Q", title="Derving (EUR)", format=",.2f"),
-                alt.Tooltip("Aantal:Q", title="Meldingen"),
-            ],
-            color=alt.value("#FF7F50"),
-        )
-        .properties(height=500)
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-    st.download_button(
-        "⬇️ Download CSV: per reason",
-        data=by_reason.to_csv(index=False).encode("utf-8"),
-        file_name="derving_per_reason.csv",
-        mime="text/csv",
-    )
+    bar_tab("Reason", "Dervingsreden", "#FF7F50", "derving_per_reason.csv")
 
 with tab4:
-    # Detailtabel (gefilterde data) + CSV
     show_cols = ["Date", "Employee", "Department", "Product", "Quantity", "Reason", "Kostprijs", "TotaalKost"]
-    show_cols = [c for c in show_cols if c in now_df.columns]
-    st.dataframe(now_df[show_cols].sort_values("Date", ascending=False), use_container_width=True, height=520)
-
+    details = now_df[show_cols].sort_values("Date", ascending=False)
+    st.dataframe(
+        details,
+        width="stretch",
+        height=520,
+        hide_index=True,
+        column_config={
+            "Date": st.column_config.DateColumn("Datum", format="DD-MM-YYYY"),
+            "Kostprijs": st.column_config.NumberColumn("Kostprijs", format="€ %.2f"),
+            "TotaalKost": st.column_config.NumberColumn("Totale kost", format="€ %.2f"),
+        },
+    )
     st.download_button(
         "⬇️ Download CSV: gefilterde details",
-        data=now_df[show_cols].to_csv(index=False).encode("utf-8"),
+        data=_csv(details),
         file_name="derving_details_gefilterd.csv",
         mime="text/csv",
     )
